@@ -125,7 +125,29 @@ def load_config(path: Path) -> dict:
             if (not isinstance(matches, list) or not matches or
                     any(not isinstance(item, str) or not item.strip() for item in matches)):
                 raise SortError(f"{key} entry {name} needs a list of match strings")
+    output = document.get("output", "")
+    if output is None or (output != "" and not isinstance(output, str)):
+        raise SortError("config output must be a path string")
+    if isinstance(output, str) and output.strip() == "" and "output" in document:
+        raise SortError("config output must be a non-empty path")
     return document
+
+
+def resolve_output(config: dict, folder: Path) -> Path:
+    """Resolve config output. Relative paths start at the input folder."""
+    raw = config.get("output") or ""
+    source = folder.resolve()
+    if not str(raw).strip():
+        return (source / "sorted").resolve()
+    path = Path(str(raw).strip())
+    if not path.is_absolute():
+        path = source / path
+    output = path.resolve()
+    if output == source:
+        raise SortError("output path must not be the input folder")
+    if output.exists() and not output.is_dir():
+        raise SortError(f"output path is not a directory: {output}")
+    return output
 
 
 def _safe_part(part: str) -> str:
@@ -253,41 +275,162 @@ def _unique_refs(references: list[tuple[str, str]]) -> list[tuple[str, str]]:
     return unique
 
 
-class SampleIndex:
-    def __init__(self):
-        self.by_name: dict[str, list[Path]] = {}
+def _reference_parts(reference: str) -> list[str]:
+    text = reference.strip().replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", text):
+        name = Path(text).name
+        return [name] if name else []
+    while text.startswith("/"):
+        text = text[1:]
+    return [part for part in text.split("/") if part not in ("", ".", "..")]
 
-    def add_tree(self, root: Path, skip: Path | None = None) -> None:
-        if not root.is_dir():
-            return
-        skip_resolved = skip.resolve() if skip is not None else None
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            current = Path(dirpath)
+
+def _match_names(filename: str) -> set[str]:
+    names = {filename.casefold()}
+    if not Path(filename).suffix:
+        names.update((filename + suffix).casefold() for suffix in AUDIO_SUFFIXES)
+    return names
+
+
+def _ancestors(preset: Path, scan_root: Path) -> list[Path]:
+    """Preset folder first, then each parent through the folder given on the command line."""
+    folders = []
+    current = preset.parent
+    while True:
+        folders.append(current)
+        if current == scan_root or scan_root not in current.parents:
+            break
+        current = current.parent
+    return folders
+
+
+class SampleFinder:
+    """Find a preset's sample by searching upward one folder level at a time.
+
+    A preset in pack1/folder1 can use pack1/folder2/required_audio.wav. The
+    preset folder is searched first. Each parent is searched only if the lower
+    level had no match, and the search stops at the command folder.
+    """
+
+    def __init__(self, scan_root: Path, output: Path, serum_roots: list[Path]):
+        self.scan_root = scan_root
+        self.output = output
+        self.serum_roots = serum_roots
+        self._listed: dict[Path, tuple[list[Path], list[Path]]] = {}
+        self._under: dict[tuple[Path, Path | None], list[Path]] = {}
+
+    def resolve(self, reference: str, kind: str, preset: Path) -> Path | None:
+        text = reference.strip()
+        if re.match(r"^[A-Za-z]:", text) or text.startswith("\\\\"):
+            absolute = Path(text)
+            if absolute.is_file():
+                return absolute
+        parts = _reference_parts(text)
+        if not parts:
+            return None
+        names = _match_names(parts[-1])
+        previous = None
+        for folder in _ancestors(preset, self.scan_root):
+            found = self._exact(folder, kind, parts)
+            if found is not None:
+                return found
+            match = _best_sample(self._audio_under(folder, previous), names, parts)
+            if match is not None:
+                return match
+            previous = folder
+        for root in self.serum_roots:
+            found = self._exact(root, kind, parts)
+            if found is not None:
+                return found
+            match = _best_sample(self._audio_under(root, None), names, parts)
+            if match is not None:
+                return match
+        return None
+
+    def _exact(self, folder: Path, kind: str, parts: list[str]) -> Path | None:
+        for prefix in ((kind,), ()):
+            candidate = folder.joinpath(*prefix, *parts)
             try:
-                if skip_resolved is not None and (current.resolve() == skip_resolved or
-                                                   skip_resolved in current.resolve().parents):
-                    dirnames[:] = []
-                    continue
+                if candidate.is_file():
+                    return candidate
             except OSError:
                 continue
-            kept = []
-            for name in dirnames:
-                child = current / name
+        return None
+
+    def _list(self, directory: Path) -> tuple[list[Path], list[Path]]:
+        try:
+            key = directory.resolve()
+        except OSError:
+            return [], []
+        cached = self._listed.get(key)
+        if cached is not None:
+            return cached
+        files: list[Path] = []
+        dirs: list[Path] = []
+        try:
+            entries = list(key.iterdir())
+        except OSError:
+            self._listed[key] = (files, dirs)
+            return files, dirs
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    if entry.resolve() == self.output:
+                        continue
+                    dirs.append(entry)
+                elif (entry.is_file() and entry.suffix.lower() in AUDIO_SUFFIXES
+                      and not entry.name.startswith("._")):
+                    files.append(entry)
+            except OSError:
+                continue
+        self._listed[key] = (files, dirs)
+        return files, dirs
+
+    def _audio_under(self, directory: Path, skip: Path | None) -> list[Path]:
+        try:
+            directory = directory.resolve()
+            skip_key = skip.resolve() if skip is not None else None
+        except OSError:
+            return []
+        cache_key = (directory, skip_key)
+        cached = self._under.get(cache_key)
+        if cached is not None:
+            return cached
+        found: list[Path] = []
+        stack = [directory]
+        while stack:
+            current = stack.pop()
+            files, dirs = self._list(current)
+            found.extend(files)
+            for child in dirs:
                 try:
-                    resolved = child.resolve()
+                    if skip_key is not None and child.resolve() == skip_key:
+                        continue
                 except OSError:
                     continue
-                if skip_resolved is not None and resolved == skip_resolved:
-                    continue
-                kept.append(name)
-            dirnames[:] = kept
-            for name in filenames:
-                if Path(name).suffix.lower() not in AUDIO_SUFFIXES:
-                    continue
-                path = current / name
-                bucket = self.by_name.setdefault(name.casefold(), [])
-                if path not in bucket:
-                    bucket.append(path)
+                stack.append(child)
+        self._under[cache_key] = found
+        return found
+
+
+def _best_sample(files: list[Path], names: set[str], parts: list[str]) -> Path | None:
+    reference = [part.casefold() for part in parts]
+    best: Path | None = None
+    best_key: tuple[int, int] | None = None
+    for path in files:
+        if path.name.casefold() not in names:
+            continue
+        tail = [part.casefold() for part in path.parts]
+        matched = 0
+        for left, right in zip(reversed(tail), reversed(reference)):
+            if left != right:
+                break
+            matched += 1
+        key = (matched, -len(tail))
+        if best_key is None or key > best_key:
+            best_key = key
+            best = path
+    return best
 
 
 def _relative_parts(reference: str) -> tuple[Path | None, PurePosixPath | None]:
@@ -299,35 +442,6 @@ def _relative_parts(reference: str) -> tuple[Path | None, PurePosixPath | None]:
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
         return None, None
     return None, relative
-
-
-def resolve_sample(reference: str, kind: str, preset: Path, scan_root: Path,
-                   serum_roots: list[Path], index: SampleIndex) -> Path | None:
-    absolute, relative = _relative_parts(reference)
-    if absolute is not None:
-        return absolute
-    if relative is None:
-        return None
-    parts = list(relative.parts)
-    folders = [preset.parent]
-    current = preset.parent
-    while current != scan_root and scan_root in current.parents:
-        current = current.parent
-        folders.append(current)
-    for folder in serum_roots + folders:
-        for prefix in ((kind,), ()):
-            candidate = folder.joinpath(*prefix, *parts)
-            if candidate.is_file():
-                return candidate
-    matches = index.by_name.get(relative.name.casefold(), [])
-    tail = tuple(part.casefold() for part in parts)
-    ranked = [path for path in matches
-              if tuple(part.casefold() for part in path.parts[-len(tail):]) == tail]
-    if ranked:
-        return min(ranked, key=lambda path: len(path.parts))
-    if len(matches) == 1:
-        return matches[0]
-    return None
 
 
 def _iter_presets(folder: Path, output: Path, recursive: bool,
@@ -386,16 +500,18 @@ def _write_unsorted(path: Path, names: list[str]) -> None:
 
 def sort_folder(folder: Path, *, serum1: bool, serum2: bool, recursive: bool,
                 config: dict, serum_roots: list[Path] | None = None,
-                dry_run: bool = False, unsorted_list: Path | None = None) -> SortResult:
+                dry_run: bool = False, unsorted_list: Path | None = None,
+                output: Path | None = None) -> SortResult:
     folder = folder.resolve()
     if not folder.is_dir():
         raise SortError(f"input is not a directory: {folder}")
-    output = folder / "sorted"
+    output = (folder / "sorted").resolve() if output is None else output.resolve()
+    if output == folder:
+        raise SortError("output path must not be the input folder")
+    if output.exists() and not output.is_dir():
+        raise SortError(f"output path is not a directory: {output}")
     roots = [path.resolve() for path in (default_roots() if serum_roots is None else serum_roots) if path.is_dir()]
-    index = SampleIndex()
-    index.add_tree(folder, output)
-    for root in roots:
-        index.add_tree(root, output)
+    finder = SampleFinder(folder, output, roots)
     result = SortResult()
     copied_samples = set()
     for path in _iter_presets(folder, output, recursive, serum1, serum2):
@@ -428,9 +544,9 @@ def sort_folder(folder: Path, *, serum1: bool, serum2: bool, recursive: bool,
             else:
                 result.copied += 1
             action = "Would copy" if dry_run and not already else "Copied" if not already else "Exists"
-            print(f"{action}: {relative} -> {preset_destination.relative_to(folder)}")
+            print(f"{action}: {relative} -> {preset_destination}")
             for kind, reference in info.references:
-                sample = resolve_sample(reference, kind, path, folder, roots, index)
+                sample = finder.resolve(reference, kind, path)
                 label = f"{relative}: {kind}/{reference}"
                 if sample is None:
                     if label not in result.missing_samples:
@@ -451,12 +567,12 @@ def sort_folder(folder: Path, *, serum1: bool, serum2: bool, recursive: bool,
                 if dry_run:
                     if not (sample_destination.exists() and filecmp.cmp(sample, sample_destination, shallow=False)):
                         result.samples_copied += 1
-                        print(f"Would copy sample: {sample} -> {sample_destination.relative_to(folder)}")
+                        print(f"Would copy sample: {sample} -> {sample_destination}")
                     continue
                 placed = _place_sample(sample, sample_destination)
                 if placed == "copied":
                     result.samples_copied += 1
-                    print(f"Copied sample: {sample} -> {sample_destination.relative_to(folder)}")
+                    print(f"Copied sample: {sample} -> {sample_destination}")
         except (OSError, SortError) as exc:
             result.failed.append(f"{path}: {exc}")
             print(f"Failed: {path}: {exc}", file=sys.stderr)
@@ -468,7 +584,7 @@ def sort_folder(folder: Path, *, serum1: bool, serum2: bool, recursive: bool,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Copy Serum 1 and Serum 2 presets into genre/group folders. "
                                      "Sources are never modified. Edit sort_serum_presets.json to add genres or groups.")
-    parser.add_argument("folder", type=Path, help="folder whose presets are copied into <folder>/sorted")
+    parser.add_argument("folder", type=Path, help="folder to scan; copies go to the config output path")
     parser.add_argument("--serum1", action="store_true", help="include Serum 1 .fxp presets")
     parser.add_argument("--serum2", action="store_true", help="include Serum 2 .SerumPreset presets")
     parser.add_argument("-r", "--recursive", action="store_true", help="include presets in subfolders")
@@ -486,9 +602,11 @@ def main(argv: list[str] | None = None) -> int:
     serum2 = args.serum2 or not args.serum1
     try:
         config = load_config(args.config)
+        output = resolve_output(config, args.folder)
+        print(f"Output: {output}")
         result = sort_folder(args.folder, serum1=serum1, serum2=serum2, recursive=args.recursive,
                              config=config, serum_roots=args.serum_root, dry_run=args.dry_run,
-                             unsorted_list=args.unsorted_list)
+                             unsorted_list=args.unsorted_list, output=output)
     except SortError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

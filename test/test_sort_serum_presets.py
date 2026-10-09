@@ -69,7 +69,8 @@ def test_shipped_config_covers_the_requested_groups():
         "Zenhiser.Psytrance.For.Serum.3/PSYFORSERUM 3 - Presets/Atmo 02 - PSYFORSERUM3.fxp", config)
     assert (genre, group) == ("psytrance", "atmo")
     assert sorter.classify("PML - Serum Techno Pack/Lead/LD Dark.fxp", config) == ("techno", "lead")
-    assert sorter.classify("notes/Init.fxp", config) == ("unsorted", "other")
+    assert sorter.classify("notes/Init.fxp", config) == (config["fallback_genre"], config["fallback_group"])
+    assert config["output"] == "./SerumPresets"
     assert sorter.classify("banks/effects/riser.fxp", config)[1] == "fx"
     assert sorter.classify("banks/sfx/hit.fxp", config)[1] == "fx"
     assert sorter.classify("banks/pads/warm.fxp", config)[1] == "pad"
@@ -128,6 +129,24 @@ def test_flags_limit_types_and_depth(tmp_path):
     assert list((root / "sorted").rglob("*.fxp"))
 
 
+def test_sibling_folder_sample_is_preferred_over_another_pack(tmp_path):
+    root = tmp_path / "AudioAssets"
+    preset = root / "pack1" / "folder1" / "Psy Bass.SerumPreset"
+    near = root / "pack1" / "folder2" / "required_audio.wav"
+    far = root / "pack2" / "folder2" / "required_audio.wav"
+    near.parent.mkdir(parents=True)
+    far.parent.mkdir(parents=True)
+    near.write_bytes(b"near-pack")
+    far.write_bytes(b"other-pack")
+    write_serum2(preset, name="Psy Bass", wt="required_audio.wav")
+    result = sorter.sort_folder(root, serum1=True, serum2=True, recursive=True, config=CONFIG, serum_roots=[])
+    copied = root / "sorted" / "psytrance" / "bass" / "Tables" / "required_audio.wav"
+    assert result.missing_samples == []
+    assert copied.read_bytes() == b"near-pack"
+    assert near.read_bytes() == b"near-pack"
+    assert far.read_bytes() == b"other-pack"
+
+
 def test_missing_sample_is_reported_and_embedded_table_is_not(tmp_path):
     root = tmp_path / "bank"
     external = root / "psy" / "Needs Noise.fxp"
@@ -183,6 +202,31 @@ def test_unsorted_names_are_saved_beside_the_script(tmp_path):
         "packs/Warm Pad.fxp",
     ]
     assert not (root / "sorted").exists()
+
+
+def test_config_output_is_relative_to_the_source_folder(tmp_path):
+    config_path = tmp_path / "elsewhere" / "sort_serum_presets.json"
+    config = dict(CONFIG, output="./SerumPresets")
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    loaded = sorter.load_config(config_path)
+    root = tmp_path / "AudioAssets"
+    source = root / "psy" / "BA - Out.fxp"
+    write_fxp(source, description="psy bass")
+    original = source.read_bytes()
+    output = sorter.resolve_output(loaded, root)
+    result = sorter.sort_folder(root, serum1=True, serum2=True, recursive=True, config=loaded,
+                                serum_roots=[], output=output)
+    copied = root / "SerumPresets" / "psytrance" / "bass" / "BA - Out.fxp"
+    assert result.copied == 1
+    assert copied.read_bytes() == original
+    assert not (root / "sorted").exists()
+    assert not (config_path.parent / "SerumPresets").exists()
+    assert source.read_bytes() == original
+    again = sorter.sort_folder(root, serum1=True, serum2=True, recursive=True, config=loaded,
+                               serum_roots=[], output=output)
+    assert again.copied == 0
+    assert again.skipped_existing == 1
 
 
 def test_dry_run_writes_nothing(tmp_path):
