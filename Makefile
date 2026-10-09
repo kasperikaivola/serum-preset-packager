@@ -1,9 +1,12 @@
-.PHONY: help install test test-update clean update-deps upgrade-deps
+.PHONY: help install test test-update clean update-deps upgrade-deps mark-pairs test-fixtures compare-backends
 
 help:
 	@echo "Available targets:"
 	@echo "  install        - Install dependencies from requirements.txt"
 	@echo "  test           - Run all tests"
+	@echo "  mark-pairs     - Label new native comparison folders pair_"
+	@echo "  test-fixtures  - Convert fixtures and report native differences"
+	@echo "  compare-backends - Compare standalone and isolated native conversion"
 	@echo "  test-update    - Run tests and update snapshots"
 	@echo "  update-deps    - Update requirements.txt with latest versions"
 	@echo "  upgrade-deps   - Upgrade all installed packages and update requirements.txt"
@@ -14,6 +17,15 @@ install:
 
 test:
 	python -m pytest test/ -v
+
+mark-pairs:
+	python mark_fixture_pairs.py
+
+test-fixtures:
+	python test_fixture_conversions.py
+
+compare-backends:
+	python compare_conversion_backends.py test/fixtures
 
 test-update:
 	python -m pytest test/ -v --snapshot-update

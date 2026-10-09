@@ -73,3 +73,16 @@ Thumbs.db
 *.tmp
 *.temp
 .cache/
+
+# Local format research, conversion examples, and focused test scratch
+/research/
+/converted-examples/
+/.test-tmp-fxp/
+/native-serum-batch.log
+test/fixtures
+
+ghidraproject
+*.fxp
+*.SerumPreset
+unsorted-presets.txt
+scripts/

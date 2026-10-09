@@ -8,7 +8,7 @@ from cli import unpack, pack
 @pytest.fixture
 def test_preset():
     """Path to the test SerumPreset file."""
-    return pathlib.Path(__file__).parent / "fixtures" / "test.SerumPreset"
+    return pathlib.Path(__file__).parent / "fixtures" / "checked_Synth__LFOish" / "Synth__LFOish.SerumPreset"
 
 
 @pytest.fixture
